@@ -1,29 +1,32 @@
+import os
+import zmq
+import cv2
+import time
+import torch
+import pickle
 import argparse
 import datetime
-import pathlib
-import sys
-import time
-import cv2
 import lietorch
-import torch
-import tqdm
-import yaml
-from mast3r_slam.global_opt import FactorGraph
+import numpy as np
+import torch.multiprocessing as mp
+from scipy.spatial.transform import Rotation as R
 
+from mast3r_slam.global_opt import FactorGraph
 from mast3r_slam.config import load_config, config, set_global_config
-from mast3r_slam.dataloader import Intrinsics, load_dataset
-import mast3r_slam.evaluate as eval
 from mast3r_slam.frame import Mode, SharedKeyframes, SharedStates, create_frame
+from mast3r_slam.tracker import FrameTracker
+from mast3r_slam.visualization import WindowMsg
+from mast3r_slam.lietorch_utils import as_SE3
 from mast3r_slam.mast3r_utils import (
     load_mast3r,
     load_retriever,
     mast3r_inference_mono,
 )
-from mast3r_slam.multiprocess_utils import new_queue, try_get_msg
-from mast3r_slam.tracker import FrameTracker
-from mast3r_slam.visualization import WindowMsg, run_visualization
-import torch.multiprocessing as mp
 
+
+### fixed values
+IMG_RESIZE_WIDTH = 512
+IMG_RESIZE_HEIGHT = 384
 
 def relocalization(frame, keyframes, factor_graph, retrieval_database):
     # we are adding and then removing from the keyframe, so we need to be careful.
@@ -142,98 +145,128 @@ def run_backend(cfg, model, states, keyframes, K):
                 idx = states.global_optimizer_tasks.pop(0)
 
 
+def extract_image(
+    parts: list, 
+    id:int, 
+    save: bool = False,
+) -> np.ndarray:
+    """
+    Extracts the image from the received parts.
+    """
+    img_format = parts[2].decode()
+    img_data = parts[3]
+    # print(f"Received image in format: {img_format}, data length: {len(img_data)} bytes")
+    arr = np.frombuffer(img_data, dtype=np.uint8)
+    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if save:
+        save_path = 'datasets/tmp'
+        os.makedirs(save_path, exist_ok=True)
+        img_name = f"image_{id}.{img_format}"
+        with open(os.path.join(save_path, img_name), 'wb') as f:
+            f.write(img_data)
+    return img
+
+
+def create_world_rotation() -> np.ndarray:
+    """ Create a rotation matrix that rotates the world coordinate system to match the OpenGL coordinate system."""
+    world_rot = np.eye(4)
+    rot_y90 = R.from_euler('y', np.deg2rad(90)).as_matrix()
+    rot_x90 = R.from_euler('x', np.deg2rad(90)).as_matrix()
+    world_rot[:3, :3] = rot_y90 @ rot_x90
+    return world_rot
+
+
+def rectify_orientation(
+    world_rot: np.ndarray,
+    points: np.ndarray, # shape: [N, 3]
+) -> np.ndarray:
+    """
+    Rectify the orientation of the point clouds to match the world coordinate system.
+    """
+    # convert to homogeneous coordinates
+    points = np.concatenate([
+        points, 
+        np.full(points.shape[0], 1, dtype=np.float32).reshape(-1, 1) # shape: [N,1]
+    ], axis=1) # shape: [N,4]
+    # rotate
+    points = (points @ (world_rot))
+    return points[:, :3]
+
+
+def rt2hom(
+    translation: np.ndarray, 
+    rotation: np.ndarray,
+) -> np.ndarray:
+    """
+    Convert translation and rotation to a homogeneous transformation matrix.
+    """
+    translation = translation.reshape(3)
+    homogeneous = np.eye(4)
+    homogeneous[:3, :3] = rotation
+    homogeneous[:3, 3] = translation
+    return homogeneous
+
+def hom2rt(
+    homogeneous: np.ndarray,
+) -> tuple:
+    """
+    Convert a homogeneous transformation matrix to translation and rotation.
+    """
+    translation = homogeneous[:3, 3].reshape(1,3)
+    rotation = homogeneous[:3, :3]
+    return rotation, translation
+
+
 if __name__ == "__main__":
+
     mp.set_start_method("spawn")
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.set_grad_enabled(False)
     device = "cuda:0"
-    save_frames = False
     datetime_now = str(datetime.datetime.now()).replace(" ", "_")
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset", default="datasets/tum/rgbd_dataset_freiburg1_desk")
     parser.add_argument("--config", default="config/base.yaml")
-    parser.add_argument("--save-as", default="default")
-    parser.add_argument("--no-viz", action="store_true")
-    parser.add_argument("--calib", default="")
-
+    parser.add_argument("--dwsp_size", type=int, default=10, help="Downsample size publishing result point cloud")
+    parser.add_argument("--calib")
     args = parser.parse_args()
 
     load_config(args.config)
-    print(args.dataset)
     print(config)
 
     manager = mp.Manager()
-    main2viz = new_queue(manager, args.no_viz)
-    viz2main = new_queue(manager, args.no_viz)
-
-    dataset = load_dataset(args.dataset)
-    dataset.subsample(config["dataset"]["subsample"])
-    h, w = dataset.get_img_shape()[0]
-
-    if args.calib:
-        with open(args.calib, "r") as f:
-            intrinsics = yaml.load(f, Loader=yaml.SafeLoader)
-        config["use_calib"] = True
-        dataset.use_calibration = True
-        dataset.camera_intrinsics = Intrinsics.from_calib(
-            dataset.img_size,
-            intrinsics["width"],
-            intrinsics["height"],
-            intrinsics["calibration"],
-        )
-
-    keyframes = SharedKeyframes(manager, h, w)
-    states = SharedStates(manager, h, w)
-
-    if not args.no_viz:
-        viz = mp.Process(
-            target=run_visualization,
-            args=(config, states, keyframes, main2viz, viz2main),
-        )
-        viz.start()
-
     model = load_mast3r(device=device)
     model.share_memory()
 
-    has_calib = dataset.has_calib()
-    use_calib = config["use_calib"]
+    ### for receiving compressed images via zmq
+    img_context = zmq.Context()
+    img_socket = img_context.socket(zmq.SUB)
+    img_socket.connect("tcp://localhost:5556")
+    img_socket.setsockopt(zmq.SUBSCRIBE, b"") # Subscribe to all topics
 
-    if use_calib and not has_calib:
-        print("[Warning] No calibration provided for this dataset!")
-        sys.exit(0)
-    K = None
-    if use_calib:
-        K = torch.from_numpy(dataset.camera_intrinsics.K_frame).to(
-            device, dtype=torch.float32
-        )
-        keyframes.set_intrinsics(K)
+    ### for sending out results via zmq
+    res_context = zmq.Context()
+    res_socket = res_context.socket(zmq.PUB)
+    res_socket.bind("tcp://127.0.0.1:5555")
 
-    # remove the trajectory from the previous run
-    if dataset.save_results:
-        save_dir, seq_name = eval.prepare_savedir(args, dataset)
-        traj_file = save_dir / f"{seq_name}.txt"
-        recon_file = save_dir / f"{seq_name}.ply"
-        if traj_file.exists():
-            traj_file.unlink()
-        if recon_file.exists():
-            recon_file.unlink()
-
+    ### prepare
+    h, w = IMG_RESIZE_HEIGHT, IMG_RESIZE_WIDTH
+    keyframes = SharedKeyframes(manager, h, w)
+    states = SharedStates(manager, h, w)
     tracker = FrameTracker(model, keyframes, device)
     last_msg = WindowMsg()
-
-    backend = mp.Process(target=run_backend, args=(config, model, states, keyframes, K))
+    backend = mp.Process(target=run_backend, args=(config, model, states, keyframes, None))
     backend.start()
 
-    i = 0
+    i = 0 # frame index
     fps_timer = time.time()
-
     frames = []
+    world_rot = create_world_rotation()
 
     while True:
+
         mode = states.get_mode()
-        msg = try_get_msg(viz2main)
-        last_msg = msg if msg is not None else last_msg
+
         if last_msg.is_terminated:
             states.set_mode(Mode.TERMINATED)
             break
@@ -246,13 +279,17 @@ if __name__ == "__main__":
         if not last_msg.is_paused:
             states.unpause()
 
-        if i == len(dataset):
+        # for live-stream task, only run 300 frames
+        if i == 300: 
             states.set_mode(Mode.TERMINATED)
             break
 
-        timestamp, img = dataset[i]
-        if save_frames:
-            frames.append(img)
+        # receive image
+        img_parts = img_socket.recv_multipart()
+        if len(img_parts) != 4:
+            print(f"Received unexpected number of parts: {len(img_parts)}")
+            continue
+        img = extract_image(parts=img_parts,id=i)
 
         # get frames last camera pose
         T_WC = (
@@ -260,7 +297,7 @@ if __name__ == "__main__":
             if i == 0
             else states.get_frame().T_WC
         )
-        frame = create_frame(i, img, T_WC, img_size=dataset.img_size, device=device)
+        frame = create_frame(i, img, T_WC, img_size=IMG_RESIZE_WIDTH, device=device)
 
         if mode == Mode.INIT:
             # Initialize via mono inference, and encoded features neeed for database
@@ -307,29 +344,82 @@ if __name__ == "__main__":
         if i % 30 == 0:
             FPS = i / (time.time() - fps_timer)
             print(f"FPS: {FPS}")
-        i += 1
 
-    if dataset.save_results:
-        save_dir, seq_name = eval.prepare_savedir(args, dataset)
-        eval.save_traj(save_dir, f"{seq_name}.txt", dataset.timestamps, keyframes)
-        eval.save_reconstruction(
-            save_dir,
-            f"{seq_name}.ply",
-            keyframes,
-            last_msg.C_conf_threshold,
-        )
-        eval.save_keyframes(
-            save_dir / "keyframes" / seq_name, dataset.timestamps, keyframes
-        )
-    if save_frames:
-        savedir = pathlib.Path(f"logs/frames/{datetime_now}")
-        savedir.mkdir(exist_ok=True, parents=True)
-        for i, frame in tqdm.tqdm(enumerate(frames), total=len(frames)):
-            frame = (frame * 255).clip(0, 255)
-            frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-            cv2.imwrite(f"{savedir}/{i}.png", frame)
+
+        ### Send results to zmq socket
+        if add_new_kf:
+            camera_poses = []
+            pointclouds = []
+            colors = []
+            # important:
+            #   use "for frame_id in range(len(keyframes))",
+            #   do not use "for keyframe in keyframes",
+            #   because SharedKeyframes instance was given a fixed length 512 when created
+            #   and the __len__ of SharedKeyframes is re-written to return number of real keyframes
+            #   check definition of SharedKeyframes
+            for frame_id in range(len(keyframes)):
+
+                keyframe = keyframes[frame_id]
+
+                # camera poses
+                T_WC = as_SE3(keyframe.T_WC)
+                x, y, z, qx, qy, qz, qw = T_WC.data.numpy().reshape(-1)
+                # note:
+                #    here construct vertical stack of translation and rotation
+                #    in order to convert to a 4x3 matrix
+                #    then it can be combined with point cloud as one array / message
+                #    and send to one single zmq socket
+                tran = np.array([x, y, z]).reshape(1, 3) # shape: [1,3]
+                rot = R.from_quat([qx, qy, qz, qw]).as_matrix() # shape: [3,3]
+                # Attention:
+                #    the tran and rot are world2cam
+                #    so we need to invert the transformation to get cam2world firstly
+                #    then convert them back again to world2cam
+                hom = rt2hom(translation=tran, rotation=rot)
+                hom = np.linalg.inv(np.linalg.inv(hom) @ world_rot)
+                rot, tran = hom2rt(hom)
+                # prepare output structure
+                rot_tran_vtack = np.vstack([tran, rot]) # shape: [4,3]
+                camera_poses.append(rot_tran_vtack)
+                print(f"Camera {frame_id}: Translation={tran}, Rotation={rot}")
+
+                # point cloud
+                pW = keyframe.T_WC.act(keyframe.X_canon).cpu().numpy().reshape(-1, 3)[::args.dwsp_size]
+                color = (keyframe.uimg.cpu().numpy() * 255).astype(np.uint8).reshape(-1, 3)[::args.dwsp_size]
+                valid = (
+                    keyframe.get_average_conf().cpu().numpy().astype(np.float32).reshape(-1)
+                    > last_msg.C_conf_threshold
+                )[::args.dwsp_size]
+                pointclouds.append(pW[valid])
+                colors.append(color[valid])
+            pointclouds = np.concatenate(pointclouds, axis=0)
+            # rotate point cloud to match world coordinate system
+            pointclouds = rectify_orientation(
+                world_rot=world_rot,
+                points=pointclouds,
+            )
+            colors = np.concatenate(colors, axis=0)
+
+            # construct the message to send
+            numbers = np.array([
+                len(pointclouds),
+                len(colors),
+                len(camera_poses),
+            ]).reshape(1,3)
+            lst = [numbers, pointclouds, colors] + camera_poses
+            res_msg = np.concatenate(lst, axis=0) # shape: [3+num_pcd+num_col+num_cameras*4, 3]
+            del lst
+
+            # Serialize and send the array
+            msg = pickle.dumps(res_msg)
+            res_socket.send(msg)
+            print(f"Sent message: ")
+            print(f"  - point cloud positions: {pointclouds.shape}")
+            print(f"  - point cloud colors: {colors.shape}")
+            print(f"  - camera poses: {len(camera_poses)} cameras, each with shape {rot_tran_vtack.shape}")
+
+        i += 1
+        print(f'Processed frame {i}')
 
     print("done")
     backend.join()
-    if not args.no_viz:
-        viz.join()
