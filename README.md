@@ -1,8 +1,10 @@
 # MASt3R-SLAM: message exchange with ZMQ socket
 
-This repository is forked and adjusted from original [MASt3R-SLAM](https://github.com/rmurai0610/MASt3R-SLAM.git). This version subscribtes to live-stream images from ZMQ socket as input, and publishes outputs (i.e. 3D point cloud and camera poses) also into ZMQ sockets.
+This repository is forked and adjusted from original [MASt3R-SLAM](https://github.com/rmurai0610/MASt3R-SLAM.git). This version gets live-stream images from ZMQ socket as input, and publishes outputs (i.e. 3D point cloud and camera poses) also into ZMQ sockets.
 
-This is part of project [ros_multidevices_rtmslam](https://github.com/MyLovelyAxe/ros_multidevices_rtmslam).
+This is part of project [ros_multidevices_rtmslam](https://github.com/MyLovelyAxe/ros_multidevices_rtmslam). Here is a demo to visualize with Rviz:
+
+![Description](mast3r_slam_in_ros_demo.gif)
 
 # Getting Started
 
@@ -28,7 +30,7 @@ pip install pyzmq==26.4.0
 Clone the repo and install the dependencies.
 
 ```bash
-git clone https://github.com/rmurai0610/MASt3R-SLAM.git --recursive
+git clone --branch ros https://github.com/rmurai0610/MASt3R-SLAM.git --recursive
 cd MASt3R-SLAM/
 
 # if you've clone the repo without --recursive run

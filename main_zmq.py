@@ -250,7 +250,9 @@ if __name__ == "__main__":
     res_socket.bind("tcp://127.0.0.1:5555")
 
     ### prepare
-    h, w = IMG_RESIZE_HEIGHT, IMG_RESIZE_WIDTH
+    # this is the desized size of all imput image, 
+    # i.e. all input images should be resized into 512x384, hard-coded
+    h, w = IMG_RESIZE_HEIGHT, IMG_RESIZE_WIDTH 
     keyframes = SharedKeyframes(manager, h, w)
     states = SharedStates(manager, h, w)
     tracker = FrameTracker(model, keyframes, device)
