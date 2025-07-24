@@ -158,6 +158,8 @@ def extract_image(
     # print(f"Received image in format: {img_format}, data length: {len(img_data)} bytes")
     arr = np.frombuffer(img_data, dtype=np.uint8)
     img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    # convert to RGB format & normalize to [0, 1] range
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB) / 255.0 
     if save:
         save_path = 'datasets/tmp'
         os.makedirs(save_path, exist_ok=True)
